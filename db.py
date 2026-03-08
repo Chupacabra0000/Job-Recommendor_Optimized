@@ -1,25 +1,55 @@
-import sqlite3
-import os
 import base64
+import datetime
 import hashlib
 import hmac
-import datetime
-from typing import Optional, List, Dict, Any, Tuple, Iterable
+import os
+import sqlite3
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 DB_PATH = os.getenv("APP_DB_PATH", "app.db")
 
 
+# ---------------- connection helpers ----------------
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def init_db() -> None:
+@contextmanager
+def _tx():
     conn = get_conn()
-    cur = conn.cursor()
+    try:
+        yield conn, conn.cursor()
+        conn.commit()
+    finally:
+        conn.close()
 
-    # ---- core tables ----
+
+# ---------------- schema / migrations ----------------
+_SAVE_SEARCHES_DDL = """
+CREATE TABLE IF NOT EXISTS saved_searches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    resume_id INTEGER,
+    resume_key TEXT NOT NULL,
+    resume_label TEXT,
+    area_id INTEGER NOT NULL,
+    timeframe_days INTEGER NOT NULL,
+    update_interval_hours INTEGER NOT NULL DEFAULT 24,
+    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    last_ranked_at TEXT,
+    last_refresh_at TEXT,
+    UNIQUE(user_id, resume_key, area_id, timeframe_days),
+    FOREIGN KEY(user_id) REFERENCES users(id),
+    FOREIGN KEY(resume_id) REFERENCES resumes(id)
+)
+"""
+
+
+def _create_tables(cur: sqlite3.Cursor) -> None:
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -65,8 +95,6 @@ def init_db() -> None:
         )
         """
     )
-
-    # ---- embedding cache (global, reused across searches/users) ----
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS vacancy_embeddings (
@@ -79,29 +107,7 @@ def init_db() -> None:
         )
         """
     )
-
-    # ---- resume-based saved searches (search history) ----
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS saved_searches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            resume_id INTEGER,
-            resume_key TEXT NOT NULL,
-            resume_label TEXT,
-            area_id INTEGER NOT NULL,
-            timeframe_days INTEGER NOT NULL,
-            update_interval_hours INTEGER NOT NULL DEFAULT 24,
-            refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            last_ranked_at TEXT,
-            last_refresh_at TEXT,
-            UNIQUE(user_id, resume_key, area_id, timeframe_days),
-            FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(resume_id) REFERENCES resumes(id)
-        )
-        """
-    )
+    cur.execute(_SAVE_SEARCHES_DDL)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS saved_search_results (
@@ -121,12 +127,6 @@ def init_db() -> None:
         )
         """
     )
-
-    # =========================
-    # ADDED FOR GLOBAL PRE-INDEX
-    # =========================
-
-    # ---- global vacancy pool (for global FAISS index) ----
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS global_vacancies (
@@ -143,8 +143,6 @@ def init_db() -> None:
         )
         """
     )
-
-    # ---- key/value storage for global index refresh timestamps ----
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS global_index_state (
@@ -154,54 +152,37 @@ def init_db() -> None:
         """
     )
 
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
-            cur.execute(
-                """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
-            )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
 
-    conn.commit()
-    conn.close()
+def _migrate_saved_searches_resume_key(cur: sqlite3.Cursor) -> None:
+    cur.execute("PRAGMA table_info(saved_searches)")
+    cols = [r[1] for r in cur.fetchall()]
+    if not cols or "resume_key" in cols:
+        return
+
+    cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old")
+    cur.execute(_SAVE_SEARCHES_DDL)
+    cur.execute(
+        """
+        INSERT INTO saved_searches (
+            id, user_id, resume_id, resume_key, resume_label, area_id, timeframe_days,
+            update_interval_hours, refresh_window_hours, created_at, last_ranked_at, last_refresh_at
+        )
+        SELECT
+            id, user_id, resume_id,
+            ('rid:' || resume_id) AS resume_key,
+            NULL AS resume_label,
+            area_id, timeframe_days,
+            update_interval_hours, refresh_window_hours, created_at, last_ranked_at, last_refresh_at
+        FROM saved_searches_old
+        """
+    )
+    cur.execute("DROP TABLE saved_searches_old")
+
+
+def init_db() -> None:
+    with _tx() as (_, cur):
+        _create_tables(cur)
+        _migrate_saved_searches_resume_key(cur)
 
 
 # ---------------- Password hashing (stdlib: PBKDF2) ----------------
@@ -240,237 +221,82 @@ def create_user(email: str, password: str) -> Tuple[bool, str]:
     if len(password) < 6:
         return False, "Пароль слишком короткий (мин. 6 символов)."
 
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO users(email, password_hash) VALUES(?, ?)",
-            (email.strip().lower(), hash_password(password)),
-        )
-        conn.commit()
-        return True, "Пользователь создан."
-    except sqlite3.IntegrityError:
-        return False, "Email уже зарегистрирован."
-    finally:
-        conn.close()
+    with _tx() as (_, cur):
+        try:
+            cur.execute(
+                "INSERT INTO users(email, password_hash) VALUES(?, ?)",
+                (email.strip().lower(), hash_password(password)),
+            )
+            return True, "Пользователь создан."
+        except sqlite3.IntegrityError:
+            return False, "Email уже зарегистрирован."
 
 
 def authenticate(email: str, password: str) -> Optional[Dict[str, Any]]:
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE email = ?", (email.strip().lower(),))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-    if not verify_password(password, row["password_hash"]):
-        return None
-    return dict(row)
+    try:
+        row = conn.execute("SELECT * FROM users WHERE email = ?", (email.strip().lower(),)).fetchone()
+        if not row:
+            return None
+        if not verify_password(password, row["password_hash"]):
+            return None
+        return dict(row)
+    finally:
+        conn.close()
 
 
 # ---------------- Resumes ----------------
 def list_resumes(user_id: int) -> List[Dict[str, Any]]:
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, name, text, created_at FROM resumes WHERE user_id = ? ORDER BY created_at DESC",
-        (user_id,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        rows = conn.execute(
+            "SELECT id, name, text, created_at FROM resumes WHERE user_id = ? ORDER BY created_at DESC, id DESC",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 def create_resume(user_id: int, name: str, text: str) -> int:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO resumes(user_id, name, text) VALUES(?, ?, ?)",
-        (user_id, name, text),
-    )
-    conn.commit()
-    rid = cur.lastrowid
-    conn.close()
-    return int(rid)
+    with _tx() as (_, cur):
+        cur.execute(
+            "INSERT INTO resumes(user_id, name, text) VALUES(?, ?, ?)",
+            (user_id, name, text),
+        )
+        return int(cur.lastrowid)
 
 
 def delete_resume(user_id: int, resume_id: int) -> None:
     """Deletes resume row only. Call search cleanup separately."""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM resumes WHERE user_id = ? AND id = ?", (user_id, resume_id))
-
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
-            cur.execute(
-                """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
-            )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
+    with _tx() as (_, cur):
+        cur.execute("DELETE FROM resumes WHERE user_id = ? AND id = ?", (user_id, resume_id))
 
 
 # ---------------- Favorites ----------------
 def list_favorites(user_id: int) -> List[str]:
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT job_id FROM favorites WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
-    rows = cur.fetchall()
-    conn.close()
-    return [str(r["job_id"]) for r in rows]
+    try:
+        rows = conn.execute(
+            "SELECT job_id FROM favorites WHERE user_id = ? ORDER BY created_at DESC, id DESC",
+            (user_id,),
+        ).fetchall()
+        return [str(r["job_id"]) for r in rows]
+    finally:
+        conn.close()
 
 
 def add_favorite(user_id: int, job_id: str) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO favorites(user_id, job_id) VALUES(?, ?)",
-        (user_id, str(job_id)),
-    )
-
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
-            cur.execute(
-                """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
-            )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
+    with _tx() as (_, cur):
+        cur.execute(
+            "INSERT OR IGNORE INTO favorites(user_id, job_id) VALUES(?, ?)",
+            (user_id, str(job_id)),
+        )
 
 
 def remove_favorite(user_id: int, job_id: str) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM favorites WHERE user_id = ? AND job_id = ?", (user_id, str(job_id)))
-
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
-            cur.execute(
-                """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
-            )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
+    with _tx() as (_, cur):
+        cur.execute("DELETE FROM favorites WHERE user_id = ? AND job_id = ?", (user_id, str(job_id)))
 
 
 # ---------------- Persistent sessions (login survive refresh) ----------------
@@ -483,249 +309,100 @@ def create_session(user_id: int, days_valid: int = 30) -> str:
     now = datetime.datetime.utcnow()
     exp = now + datetime.timedelta(days=days_valid)
 
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO sessions(token, user_id, expires_at) VALUES(?, ?, ?)",
-        (token, user_id, exp.isoformat() + "Z"),
-    )
-
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
-            cur.execute(
-                """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
-            )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
+    with _tx() as (_, cur):
+        cur.execute(
+            "INSERT INTO sessions(token, user_id, expires_at) VALUES(?, ?, ?)",
+            (token, user_id, exp.isoformat() + "Z"),
+        )
     return token
 
 
 def get_user_by_token(token: str) -> Optional[Dict[str, Any]]:
     if not token:
         return None
+
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT u.* FROM sessions s
-        JOIN users u ON u.id = s.user_id
-        WHERE s.token = ?
-        """,
-        (token,),
-    )
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return None
-
-    # expiry check
-    cur.execute("SELECT expires_at FROM sessions WHERE token = ?", (token,))
-    srow = cur.fetchone()
-    conn.close()
     try:
-        exp = datetime.datetime.fromisoformat(str(srow["expires_at"]).replace("Z", ""))
-        if datetime.datetime.utcnow() > exp:
-            delete_session(token)
+        row = conn.execute(
+            """
+            SELECT u.*, s.expires_at
+            FROM sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token = ?
+            """,
+            (token,),
+        ).fetchone()
+        if not row:
             return None
-    except Exception:
-        return None
 
-    return dict(row)
+        try:
+            exp = datetime.datetime.fromisoformat(str(row["expires_at"]).replace("Z", ""))
+            if datetime.datetime.utcnow() > exp:
+                conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+                conn.commit()
+                return None
+        except Exception:
+            return None
+
+        payload = dict(row)
+        payload.pop("expires_at", None)
+        return payload
+    finally:
+        conn.close()
 
 
 def delete_session(token: str) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
-
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
-            cur.execute(
-                """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
-            )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
+    with _tx() as (_, cur):
+        cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
 
 
 # ---------------- Vacancy embeddings cache ----------------
 def get_embedding(vacancy_id: str, model_name: str) -> Optional[Tuple[int, bytes]]:
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT dim, emb_blob FROM vacancy_embeddings WHERE vacancy_id = ? AND model_name = ?",
-        (str(vacancy_id), str(model_name)),
-    )
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return int(row["dim"]), row["emb_blob"]
+    try:
+        row = conn.execute(
+            "SELECT dim, emb_blob FROM vacancy_embeddings WHERE vacancy_id = ? AND model_name = ?",
+            (str(vacancy_id), str(model_name)),
+        ).fetchone()
+        if not row:
+            return None
+        return int(row["dim"]), row["emb_blob"]
+    finally:
+        conn.close()
 
 
 def put_embedding(vacancy_id: str, model_name: str, dim: int, emb_blob: bytes) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO vacancy_embeddings(vacancy_id, model_name, dim, emb_blob, updated_at)
-        VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(vacancy_id, model_name) DO UPDATE SET
-            dim=excluded.dim,
-            emb_blob=excluded.emb_blob,
-            updated_at=CURRENT_TIMESTAMP
-        """,
-        (str(vacancy_id), str(model_name), int(dim), sqlite3.Binary(emb_blob)),
-    )
-
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
-            cur.execute(
-                """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
-            )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
+    with _tx() as (_, cur):
+        cur.execute(
+            """
+            INSERT INTO vacancy_embeddings(vacancy_id, model_name, dim, emb_blob, updated_at)
+            VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(vacancy_id, model_name) DO UPDATE SET
+                dim=excluded.dim,
+                emb_blob=excluded.emb_blob,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (str(vacancy_id), str(model_name), int(dim), sqlite3.Binary(emb_blob)),
+        )
 
 
 # ---------------- Saved searches (resume-based history) ----------------
 def list_saved_searches(user_id: int) -> List[Dict[str, Any]]:
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT ss.*, r.name AS resume_name
-        FROM saved_searches ss
-        JOIN resumes r ON r.id = ss.resume_id
-        WHERE ss.user_id = ?
-        ORDER BY ss.created_at DESC
-        """,
-        (user_id,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        rows = conn.execute(
+            """
+            SELECT ss.*, r.name AS resume_name
+            FROM saved_searches ss
+            JOIN resumes r ON r.id = ss.resume_id
+            WHERE ss.user_id = ?
+            ORDER BY ss.created_at DESC, ss.id DESC
+            """,
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 def get_latest_saved_search(user_id: int) -> Optional[Dict[str, Any]]:
@@ -750,354 +427,95 @@ def create_or_get_saved_search(
       - "rid:123" for stored resumes
       - "pdf:<sha256>" for PDF text searches
     """
-    conn = get_conn()
-    cur = conn.cursor()
+    with _tx() as (_, cur):
+        row = cur.execute(
+            """
+            SELECT id FROM saved_searches
+            WHERE user_id=? AND resume_key=? AND area_id=? AND timeframe_days=?
+            """,
+            (int(user_id), str(resume_key), int(area_id), int(timeframe_days)),
+        ).fetchone()
+        if row:
+            sid = int(row["id"])
+            cur.execute(
+                """
+                UPDATE saved_searches
+                SET resume_id=?, resume_label=?, update_interval_hours=?, refresh_window_hours=?
+                WHERE id=?
+                """,
+                (resume_id, resume_label, int(update_interval_hours), int(refresh_window_hours), sid),
+            )
+            return sid, False
 
-    cur.execute(
-        """
-        SELECT id FROM saved_searches
-        WHERE user_id=? AND resume_key=? AND area_id=? AND timeframe_days=?
-        """,
-        (int(user_id), str(resume_key), int(area_id), int(timeframe_days)),
-    )
-    row = cur.fetchone()
-    if row:
-        sid = int(row["id"])
         cur.execute(
             """
-            UPDATE saved_searches
-            SET resume_id=?, resume_label=?, update_interval_hours=?, refresh_window_hours=?
-            WHERE id=?
+            INSERT INTO saved_searches (user_id, resume_id, resume_key, resume_label, area_id, timeframe_days, update_interval_hours, refresh_window_hours)
+            VALUES (?,?,?,?,?,?,?,?)
             """,
-            (resume_id, resume_label, int(update_interval_hours), int(refresh_window_hours), sid),
+            (
+                int(user_id),
+                resume_id,
+                str(resume_key),
+                resume_label,
+                int(area_id),
+                int(timeframe_days),
+                int(update_interval_hours),
+                int(refresh_window_hours),
+            ),
         )
-        conn.commit()
-        conn.close()
-        return sid, False
-
-    cur.execute(
-        """
-        INSERT INTO saved_searches (user_id, resume_id, resume_key, resume_label, area_id, timeframe_days, update_interval_hours, refresh_window_hours)
-        VALUES (?,?,?,?,?,?,?,?)
-        """,
-        (
-            int(user_id),
-            resume_id,
-            str(resume_key),
-            resume_label,
-            int(area_id),
-            int(timeframe_days),
-            int(update_interval_hours),
-            int(refresh_window_hours),
-        ),
-    )
-    sid = int(cur.lastrowid)
-    conn.commit()
-    conn.close()
-    return sid, True
+        return int(cur.lastrowid), True
 
 
 def touch_ranked(search_id: int) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE saved_searches SET last_ranked_at=CURRENT_TIMESTAMP WHERE id=?",
-        (int(search_id),),
-    )
-
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
-            cur.execute(
-                """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
-            )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
+    with _tx() as (_, cur):
+        cur.execute(
+            "UPDATE saved_searches SET last_ranked_at=CURRENT_TIMESTAMP WHERE id=?",
+            (int(search_id),),
+        )
 
 
 def touch_refreshed(search_id: int) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE saved_searches SET last_refresh_at=CURRENT_TIMESTAMP WHERE id=?",
-        (int(search_id),),
-    )
-
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
-            cur.execute(
-                """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
-            )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
+    with _tx() as (_, cur):
+        cur.execute(
+            "UPDATE saved_searches SET last_refresh_at=CURRENT_TIMESTAMP WHERE id=?",
+            (int(search_id),),
+        )
 
 
 def delete_saved_search(search_id: int) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM saved_search_results WHERE search_id=?", (int(search_id),))
-    cur.execute("DELETE FROM saved_searches WHERE id=?", (int(search_id),))
-
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
-            cur.execute(
-                """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
-            )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
+    with _tx() as (_, cur):
+        cur.execute("DELETE FROM saved_search_results WHERE search_id=?", (int(search_id),))
+        cur.execute("DELETE FROM saved_searches WHERE id=?", (int(search_id),))
 
 
 def delete_saved_searches_for_resume(user_id: int, resume_id: int) -> List[int]:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id FROM saved_searches WHERE user_id=? AND resume_id=?",
-        (user_id, resume_id),
-    )
-    rows = cur.fetchall()
-    ids = [int(r["id"]) for r in rows]
-    for sid in ids:
-        cur.execute("DELETE FROM saved_search_results WHERE search_id=?", (sid,))
-        cur.execute("DELETE FROM saved_searches WHERE id=?", (sid,))
-
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
-            cur.execute(
-                """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
-            )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
-    return ids
+    with _tx() as (_, cur):
+        rows = cur.execute(
+            "SELECT id FROM saved_searches WHERE user_id=? AND resume_id=?",
+            (user_id, resume_id),
+        ).fetchall()
+        ids = [int(r["id"]) for r in rows]
+        for sid in ids:
+            cur.execute("DELETE FROM saved_search_results WHERE search_id=?", (sid,))
+            cur.execute("DELETE FROM saved_searches WHERE id=?", (sid,))
+        return ids
 
 
 def enforce_saved_search_limit(user_id: int, keep_n: int = 3) -> List[int]:
     """
     Keep only last N searches for user. Returns deleted search_ids.
     """
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id FROM saved_searches WHERE user_id=? ORDER BY created_at DESC",
-        (user_id,),
-    )
-    ids = [int(r["id"]) for r in cur.fetchall()]
-    to_delete = ids[keep_n:]
-    for sid in to_delete:
-        cur.execute("DELETE FROM saved_search_results WHERE search_id=?", (sid,))
-        cur.execute("DELETE FROM saved_searches WHERE id=?", (sid,))
-
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
-            cur.execute(
-                """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
-            )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
-    return to_delete
+    with _tx() as (_, cur):
+        rows = cur.execute(
+            "SELECT id FROM saved_searches WHERE user_id=? ORDER BY created_at DESC, id DESC",
+            (user_id,),
+        ).fetchall()
+        ids = [int(r["id"]) for r in rows]
+        to_delete = ids[keep_n:]
+        for sid in to_delete:
+            cur.execute("DELETE FROM saved_search_results WHERE search_id=?", (sid,))
+            cur.execute("DELETE FROM saved_searches WHERE id=?", (sid,))
+        return to_delete
 
 
 # ---------------- Saved search results ----------------
@@ -1107,342 +525,178 @@ def upsert_saved_search_results(search_id: int, rows: List[Dict[str, Any]]) -> N
       vacancy_id, published_at, title, employer, url, snippet_req, snippet_resp, salary_text
     score can be provided (optional).
     """
-    conn = get_conn()
-    cur = conn.cursor()
-    for r in rows:
-        cur.execute(
-            """
-            INSERT INTO saved_search_results(
-              search_id, vacancy_id, published_at, title, employer, url,
-              snippet_req, snippet_resp, salary_text, score, updated_at
-            )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(search_id, vacancy_id) DO UPDATE SET
-              published_at=excluded.published_at,
-              title=excluded.title,
-              employer=excluded.employer,
-              url=excluded.url,
-              snippet_req=excluded.snippet_req,
-              snippet_resp=excluded.snippet_resp,
-              salary_text=excluded.salary_text,
-              score=COALESCE(excluded.score, saved_search_results.score),
-              updated_at=CURRENT_TIMESTAMP
-            """,
-            (
-                int(search_id),
-                str(r.get("vacancy_id")),
-                r.get("published_at"),
-                r.get("title"),
-                r.get("employer"),
-                r.get("url"),
-                r.get("snippet_req"),
-                r.get("snippet_resp"),
-                r.get("salary_text"),
-                r.get("score"),
-            ),
-        )
-
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
+    with _tx() as (_, cur):
+        for r in rows:
             cur.execute(
                 """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
+                INSERT INTO saved_search_results(
+                  search_id, vacancy_id, published_at, title, employer, url,
+                  snippet_req, snippet_resp, salary_text, score, updated_at
                 )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(search_id, vacancy_id) DO UPDATE SET
+                  published_at=excluded.published_at,
+                  title=excluded.title,
+                  employer=excluded.employer,
+                  url=excluded.url,
+                  snippet_req=excluded.snippet_req,
+                  snippet_resp=excluded.snippet_resp,
+                  salary_text=excluded.salary_text,
+                  score=COALESCE(excluded.score, saved_search_results.score),
+                  updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    int(search_id),
+                    str(r.get("vacancy_id")),
+                    r.get("published_at"),
+                    r.get("title"),
+                    r.get("employer"),
+                    r.get("url"),
+                    r.get("snippet_req"),
+                    r.get("snippet_resp"),
+                    r.get("salary_text"),
+                    r.get("score"),
+                ),
             )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
 
 
 def set_saved_search_scores(search_id: int, scores: Dict[str, float]) -> None:
     """
     Update score for given vacancy_ids. Does not touch others.
     """
-    conn = get_conn()
-    cur = conn.cursor()
-    for vid, sc in scores.items():
-        cur.execute(
-            "UPDATE saved_search_results SET score=?, updated_at=CURRENT_TIMESTAMP WHERE search_id=? AND vacancy_id=?",
-            (float(sc), int(search_id), str(vid)),
-        )
-
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
+    with _tx() as (_, cur):
+        for vid, sc in scores.items():
             cur.execute(
-                """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
+                "UPDATE saved_search_results SET score=?, updated_at=CURRENT_TIMESTAMP WHERE search_id=? AND vacancy_id=?",
+                (float(sc), int(search_id), str(vid)),
             )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
-            )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
 
 
 def prune_saved_search_results(search_id: int, cutoff_iso: str) -> int:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "DELETE FROM saved_search_results WHERE search_id=? AND published_at IS NOT NULL AND published_at < ?",
-        (int(search_id), str(cutoff_iso)),
-    )
-    deleted = cur.rowcount
-
-    # ---- migration: add resume_key to saved_searches (support PDF searches) ----
-    try:
-        cur.execute("PRAGMA table_info(saved_searches)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "resume_key" not in cols:
-            cur.execute("ALTER TABLE saved_searches RENAME TO saved_searches_old;")
-            cur.execute(
-                """
-                CREATE TABLE saved_searches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    resume_id INTEGER,
-                    resume_key TEXT NOT NULL,
-                    resume_label TEXT,
-                    area_id INTEGER NOT NULL,
-                    timeframe_days INTEGER NOT NULL,
-                    update_interval_hours INTEGER NOT NULL DEFAULT 24,
-                    refresh_window_hours INTEGER NOT NULL DEFAULT 24,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                    last_ranked_at TEXT,
-                    last_refresh_at TEXT,
-                    UNIQUE(user_id, resume_key, area_id, timeframe_days),
-                    FOREIGN KEY(user_id) REFERENCES users(id),
-                    FOREIGN KEY(resume_id) REFERENCES resumes(id)
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO saved_searches (
-                    id,user_id,resume_id,resume_key,resume_label,area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                )
-                SELECT
-                    id,user_id,resume_id,
-                    ('rid:' || resume_id) AS resume_key,
-                    NULL AS resume_label,
-                    area_id,timeframe_days,
-                    update_interval_hours,refresh_window_hours,created_at,last_ranked_at,last_refresh_at
-                FROM saved_searches_old;
-                """
-            )
-            cur.execute("DROP TABLE saved_searches_old;")
-    except Exception:
-        pass
-
-    conn.commit()
-    conn.close()
-    return int(deleted)
+    with _tx() as (_, cur):
+        cur.execute(
+            "DELETE FROM saved_search_results WHERE search_id=? AND published_at IS NOT NULL AND published_at < ?",
+            (int(search_id), str(cutoff_iso)),
+        )
+        return int(cur.rowcount)
 
 
 def list_saved_search_results(search_id: int, order_by_score: bool = True) -> List[Dict[str, Any]]:
     conn = get_conn()
-    cur = conn.cursor()
-    if order_by_score:
-        cur.execute(
-            """
-            SELECT * FROM saved_search_results
-            WHERE search_id=?
-            ORDER BY (score IS NULL) ASC, score DESC, published_at DESC
-            """,
-            (int(search_id),),
-        )
-    else:
-        cur.execute(
-            """
-            SELECT * FROM saved_search_results
-            WHERE search_id=?
-            ORDER BY published_at DESC
-            """,
-            (int(search_id),),
-        )
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        if order_by_score:
+            rows = conn.execute(
+                """
+                SELECT * FROM saved_search_results
+                WHERE search_id=?
+                ORDER BY (score IS NULL) ASC, score DESC, published_at DESC
+                """,
+                (int(search_id),),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM saved_search_results
+                WHERE search_id=?
+                ORDER BY published_at DESC
+                """,
+                (int(search_id),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 def list_default_timeline(user_id: int, limit: int = 5000) -> List[Dict[str, Any]]:
     """Merged saved vacancies across user's saved searches using MOST RECENT search score per vacancy."""
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT vacancy_id, published_at, title, employer, url, snippet_req, snippet_resp, salary_text, score
-        FROM (
-            SELECT
-                r.*,
-                s.last_ranked_at,
-                s.created_at,
-                ROW_NUMBER() OVER (
-                    PARTITION BY r.vacancy_id
-                    ORDER BY COALESCE(s.last_ranked_at, s.created_at) DESC
-                ) AS rn
-            FROM saved_search_results r
-            JOIN saved_searches s ON s.id = r.search_id
-            WHERE s.user_id = ?
-        )
-        WHERE rn = 1
-        ORDER BY (score IS NULL) ASC, score DESC
-        LIMIT ?
-        """,
-        (int(user_id), int(limit)),
-    )
-    rows = [dict(x) for x in cur.fetchall()]
-    conn.close()
-    return rows
+    try:
+        rows = conn.execute(
+            """
+            SELECT vacancy_id, published_at, title, employer, url, snippet_req, snippet_resp, salary_text, score
+            FROM (
+                SELECT
+                    r.*,
+                    s.last_ranked_at,
+                    s.created_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY r.vacancy_id
+                        ORDER BY COALESCE(s.last_ranked_at, s.created_at) DESC
+                    ) AS rn
+                FROM saved_search_results r
+                JOIN saved_searches s ON s.id = r.search_id
+                WHERE s.user_id = ?
+            )
+            WHERE rn = 1
+            ORDER BY (score IS NULL) ASC, score DESC
+            LIMIT ?
+            """,
+            (int(user_id), int(limit)),
+        ).fetchall()
+        return [dict(x) for x in rows]
+    finally:
+        conn.close()
 
 
-# =========================
-# ADDED FOR GLOBAL PRE-INDEX
-# =========================
-
+# ---------------- Global pre-index helpers ----------------
 def upsert_global_vacancies(rows: List[Dict[str, Any]]) -> None:
     """
     rows entries must include:
       vacancy_id, area_id, published_at, title, employer, url, snippet_req, snippet_resp, salary_text
     """
-    conn = get_conn()
-    cur = conn.cursor()
-
-    for r in rows:
-        cur.execute(
-            """
-            INSERT INTO global_vacancies(
-                vacancy_id, area_id, published_at, title,
-                employer, url, snippet_req, snippet_resp, salary_text, updated_at
+    with _tx() as (_, cur):
+        for r in rows:
+            cur.execute(
+                """
+                INSERT INTO global_vacancies(
+                    vacancy_id, area_id, published_at, title,
+                    employer, url, snippet_req, snippet_resp, salary_text, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(vacancy_id) DO UPDATE SET
+                    area_id=excluded.area_id,
+                    published_at=excluded.published_at,
+                    title=excluded.title,
+                    employer=excluded.employer,
+                    url=excluded.url,
+                    snippet_req=excluded.snippet_req,
+                    snippet_resp=excluded.snippet_resp,
+                    salary_text=excluded.salary_text,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    str(r.get("vacancy_id")),
+                    int(r.get("area_id")) if r.get("area_id") is not None else None,
+                    r.get("published_at"),
+                    r.get("title"),
+                    r.get("employer"),
+                    r.get("url"),
+                    r.get("snippet_req"),
+                    r.get("snippet_resp"),
+                    r.get("salary_text"),
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(vacancy_id) DO UPDATE SET
-                area_id=excluded.area_id,
-                published_at=excluded.published_at,
-                title=excluded.title,
-                employer=excluded.employer,
-                url=excluded.url,
-                snippet_req=excluded.snippet_req,
-                snippet_resp=excluded.snippet_resp,
-                salary_text=excluded.salary_text,
-                updated_at=CURRENT_TIMESTAMP
-            """,
-            (
-                str(r.get("vacancy_id")),
-                int(r.get("area_id")) if r.get("area_id") is not None else None,
-                r.get("published_at"),
-                r.get("title"),
-                r.get("employer"),
-                r.get("url"),
-                r.get("snippet_req"),
-                r.get("snippet_resp"),
-                r.get("salary_text"),
-            ),
-        )
-
-    conn.commit()
-    conn.close()
 
 
 def get_global_index_state(key: str) -> Optional[str]:
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM global_index_state WHERE key=?", (str(key),))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return row["value"]
+    try:
+        row = conn.execute("SELECT value FROM global_index_state WHERE key=?", (str(key),)).fetchone()
+        return None if not row else row["value"]
+    finally:
+        conn.close()
 
 
 def set_global_index_state(key: str, value: str) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO global_index_state(key, value)
-        VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-        """,
-        (str(key), str(value)),
-    )
-    conn.commit()
-    conn.close()
+    with _tx() as (_, cur):
+        cur.execute(
+            """
+            INSERT INTO global_index_state(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (str(key), str(value)),
+        )
 
 
 def global_has_vacancy_ids(ids: List[str]) -> set:
@@ -1452,21 +706,20 @@ def global_has_vacancy_ids(ids: List[str]) -> set:
         return set()
 
     conn = get_conn()
-    cur = conn.cursor()
-    out = set()
-
-    CHUNK = 500
-    for i in range(0, len(ids), CHUNK):
-        chunk = ids[i:i + CHUNK]
-        placeholders = ",".join(["?"] * len(chunk))
-        cur.execute(
-            f"SELECT vacancy_id FROM global_vacancies WHERE vacancy_id IN ({placeholders})",
-            tuple(chunk),
-        )
-        out |= {str(r["vacancy_id"]) for r in cur.fetchall()}
-
-    conn.close()
-    return out
+    try:
+        out = set()
+        chunk_size = 500
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i : i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            rows = conn.execute(
+                f"SELECT vacancy_id FROM global_vacancies WHERE vacancy_id IN ({placeholders})",
+                tuple(chunk),
+            ).fetchall()
+            out |= {str(r["vacancy_id"]) for r in rows}
+        return out
+    finally:
+        conn.close()
 
 
 def set_global_index_state_if_newer(key: str, value_iso_z: str) -> None:
@@ -1479,22 +732,19 @@ def set_global_index_state_if_newer(key: str, value_iso_z: str) -> None:
         set_global_index_state(key, value_iso_z)
 
 
-
-
-
 def get_max_global_published_at(area_id: int) -> Optional[str]:
     """Newest published_at we have for this area_id (ISO string)."""
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT MAX(published_at) AS mx FROM global_vacancies WHERE area_id=? AND published_at IS NOT NULL",
-        (int(area_id),),
-    )
-    row = cur.fetchone()
-    conn.close()
-    if not row or not row["mx"]:
-        return None
-    return str(row["mx"])
+    try:
+        row = conn.execute(
+            "SELECT MAX(published_at) AS mx FROM global_vacancies WHERE area_id=? AND published_at IS NOT NULL",
+            (int(area_id),),
+        ).fetchone()
+        if not row or not row["mx"]:
+            return None
+        return str(row["mx"])
+    finally:
+        conn.close()
 
 
 def replace_global_vacancies_for_area(area_id: int, rows: List[Dict[str, Any]]) -> None:
@@ -1502,33 +752,30 @@ def replace_global_vacancies_for_area(area_id: int, rows: List[Dict[str, Any]]) 
     Full rebuild behavior: replace the pool for a given area_id.
     Keeps table bounded over time.
     """
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM global_vacancies WHERE area_id = ?", (int(area_id),))
-
-    cur.executemany(
-        """
-        INSERT INTO global_vacancies (
-            vacancy_id, area_id, published_at, title, employer, url,
-            snippet_req, snippet_resp, salary_text, updated_at
-        ) VALUES (
-            :vacancy_id, :area_id, :published_at, :title, :employer, :url,
-            :snippet_req, :snippet_resp, :salary_text, CURRENT_TIMESTAMP
+    with _tx() as (_, cur):
+        cur.execute("DELETE FROM global_vacancies WHERE area_id = ?", (int(area_id),))
+        cur.executemany(
+            """
+            INSERT INTO global_vacancies (
+                vacancy_id, area_id, published_at, title, employer, url,
+                snippet_req, snippet_resp, salary_text, updated_at
+            ) VALUES (
+                :vacancy_id, :area_id, :published_at, :title, :employer, :url,
+                :snippet_req, :snippet_resp, :salary_text, CURRENT_TIMESTAMP
+            )
+            ON CONFLICT(vacancy_id) DO UPDATE SET
+                area_id=excluded.area_id,
+                published_at=excluded.published_at,
+                title=excluded.title,
+                employer=excluded.employer,
+                url=excluded.url,
+                snippet_req=excluded.snippet_req,
+                snippet_resp=excluded.snippet_resp,
+                salary_text=excluded.salary_text,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            rows,
         )
-        ON CONFLICT(vacancy_id) DO UPDATE SET
-            area_id=excluded.area_id,
-            published_at=excluded.published_at,
-            title=excluded.title,
-            employer=excluded.employer,
-            url=excluded.url,
-            snippet_req=excluded.snippet_req,
-            snippet_resp=excluded.snippet_resp,
-            salary_text=excluded.salary_text,
-            updated_at=CURRENT_TIMESTAMP
-        """,
-        rows,
-    )
-    conn.commit()
 
 
 def prune_global_vacancies_for_area(area_id: int, cutoff_iso: str) -> int:
@@ -1537,19 +784,17 @@ def prune_global_vacancies_for_area(area_id: int, cutoff_iso: str) -> int:
     cutoff_iso: ISO8601 string.
     Returns deleted row count.
     """
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        DELETE FROM global_vacancies
-        WHERE area_id = ?
-          AND published_at IS NOT NULL
-          AND published_at < ?
-        """,
-        (int(area_id), cutoff_iso),
-    )
-    conn.commit()
-    return int(cur.rowcount)
+    with _tx() as (_, cur):
+        cur.execute(
+            """
+            DELETE FROM global_vacancies
+            WHERE area_id = ?
+              AND published_at IS NOT NULL
+              AND published_at < ?
+            """,
+            (int(area_id), cutoff_iso),
+        )
+        return int(cur.rowcount)
 
 
 def list_all_global_vacancy_ids() -> List[str]:
@@ -1558,6 +803,8 @@ def list_all_global_vacancy_ids() -> List[str]:
     across all areas.
     """
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT vacancy_id FROM global_vacancies")
-    return [str(r[0]) for r in cur.fetchall() if r and r[0]]
+    try:
+        rows = conn.execute("SELECT vacancy_id FROM global_vacancies").fetchall()
+        return [str(r[0]) for r in rows if r and r[0]]
+    finally:
+        conn.close()
