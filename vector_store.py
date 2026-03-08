@@ -155,9 +155,9 @@ def compact_store(model_name: str, ids_keep: np.ndarray) -> None:
     tmp_dir = os.path.dirname(vec_path)
     os.makedirs(tmp_dir, exist_ok=True)
 
-    vec_tmp = vec_path + ".tmp"
-    ids_tmp = ids_path + ".tmp"
-    meta_tmp = meta_path + ".tmp"
+    vec_tmp = vec_path + ".tmp.npy"
+    ids_tmp = ids_path + ".tmp.npy"
+    meta_tmp = meta_path + ".tmp.npy"
 
     # Write vecs
     with open(vec_tmp, "wb") as f:
