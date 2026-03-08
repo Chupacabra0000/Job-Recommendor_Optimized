@@ -159,5 +159,15 @@ class JobRecommendationSystem:
 
         rk = top_terms_sparse(0)
         jk = top_terms_sparse(1)
-        matched = [t for t in rk if t in set(jk)]
-        return {"resume_keywords": rk, "job_keywords": jk, "matched_keywords": matched[:top_k]}
+
+        # matched keywords should be based on all shared non-zero terms, not only the two truncated top-k lists
+        shared_idx = set(X[0].indices).intersection(set(X[1].indices))
+        shared_terms = [terms[i] for i in shared_idx]
+
+        # rank shared terms by combined tf-idf weight across both texts
+        shared_terms = sorted(
+            shared_terms,
+            key=lambda t: float(X[0, np.where(terms == t)[0][0]] + X[1, np.where(terms == t)[0][0]]),
+            reverse=True,
+        )
+        return {"resume_keywords": rk, "job_keywords": jk, "matched_keywords": shared_terms[:top_k]}
