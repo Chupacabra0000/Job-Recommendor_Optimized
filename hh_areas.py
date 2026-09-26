@@ -118,8 +118,12 @@ def list_regions_and_cities(
             if cid and cname:
                 cities.append({"id": cid, "name": cname})
 
-        # some regions can have deeper nesting; include deeper leaves as well
-        if not cities:
+        # some regions can have deeper nesting; include deepest leaves as well
+        def _has_children(node: Dict[str, Any]) -> bool:
+            return bool((node.get("areas") or []))
+
+        if not cities or any(_has_children(c) for c in (region.get("areas", []) or [])):
+            cities = []
             stack = list(region.get("areas", []) or [])
             while stack:
                 node = stack.pop()
