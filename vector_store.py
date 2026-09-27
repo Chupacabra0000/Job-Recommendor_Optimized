@@ -174,6 +174,12 @@ def compact_store(model_name: str, ids_keep: np.ndarray) -> None:
     with open(meta_tmp, "w", encoding="utf-8") as f:
         json.dump(new_meta, f)
 
+    # Windows 
+    # memory-mapped view. Close the mapped source before the atomic swap.
+    if mm is not None:
+        del mm
+
+
     # Atomic swap
     os.replace(vec_tmp, vec_path)
     os.replace(ids_tmp, ids_path)
