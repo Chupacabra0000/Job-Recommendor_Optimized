@@ -808,7 +808,7 @@ period_days = st.sidebar.selectbox("Период вакансий (дней)", [
 update_hours = st.sidebar.selectbox("Авто-обновление (часы)", [6, 12, 24], index=2)
 
 st.sidebar.subheader("Резюме")
-resume_source = st.sidebar.radio("Источник резюме", ["None", "PDF resume", "Created resume"], index=0)
+resume_source = st.sidebar.radio("Источник резюме", ["Без Резюме", "PDF Резме", "Создание"], index=0)
 st.session_state.resume_source = resume_source
 
 if resume_source == "PDF resume":
@@ -879,8 +879,8 @@ st.session_state.page_size = int(page_size)
 do_search = st.sidebar.button("Поиск", use_container_width=True)
 
 # ---------- header ----------
-st.title("💼 HH.ru Job Recommender")
-st.caption("По умолчанию показываем 500 вакансий. Все последующие запросы к HH — только по кнопке **Поиск**.")
+st.title("💼Job Recommender")
+st.caption("По умолчанию показываем последние ~500 вакансий. Все последующие запросы только по кнопке **Поиск**.")
 
 favorites = set(list_favorites(user_id))
 
