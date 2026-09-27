@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
-import fitz  # PyMuPDF
+import fitz  
 import pandas as pd
 
 from db import (
@@ -28,7 +28,6 @@ from tfidf_terms import extract_terms
 from hh_areas import fetch_areas_tree, list_regions_and_cities
 from faiss_search_index import delete_index_dir
 
-# Unified embedding storage: vector_store is canonical
 from vector_store import init_store as init_vec_store
 from vector_store import load_ids as load_vec_ids
 from vector_store import load_memmap as load_vec_memmap
@@ -703,7 +702,7 @@ def _try_global_rank(resume_text: str, area_id: int, period_days: int) -> Option
     return df
 
 
-# ---------- auth UI (centered) ----------
+# ---------- auth UI ----------
 def auth_screen():
     left, center, right = st.columns([2, 2, 2])
 
@@ -787,7 +786,6 @@ update_hours = st.sidebar.selectbox("Авто-обновление (часы)", 
 
 st.sidebar.subheader("Резюме")
 
-# ✅ Removed "create resume" button (per your request)
 resume_source = st.sidebar.radio("Источник резюме", ["None", "PDF resume", "Created resume"], index=0)
 st.session_state.resume_source = resume_source
 
