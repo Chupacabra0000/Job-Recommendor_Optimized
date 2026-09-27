@@ -1,4 +1,5 @@
 import math
+import os
 import numpy as np
 import re
 import html as _html
@@ -8,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
-import fitz  
+import fitz  # PyMuPDF
 import pandas as pd
 
 from db import (
@@ -28,6 +29,7 @@ from tfidf_terms import extract_terms
 from hh_areas import fetch_areas_tree, list_regions_and_cities
 from faiss_search_index import delete_index_dir
 
+# Unified 
 from vector_store import init_store as init_vec_store
 from vector_store import load_ids as load_vec_ids
 from vector_store import load_memmap as load_vec_memmap
@@ -69,10 +71,23 @@ GLOBAL_MAX_ITEMS = 5000
 GLOBAL_TOPK = 1200
 GLOBAL_MIN_HOURS_BETWEEN_REFRESH = 24
 
+def _apply_hh_oauth_from_streamlit_secrets() -> None:
+    """Load HH OAuth settings from Streamlit secrets into process env if present."""
+    key_map = {
+        "HH_CLIENT_ID": "HH_CLIENT_ID",
+        "HH_CLIENT_SECRET": "HH_CLIENT_SECRET",
+        "HH_OAUTH_TOKEN_URL": "HH_OAUTH_TOKEN_URL",
+        "HH_OAUTH_GRANT_TYPE": "HH_OAUTH_GRANT_TYPE",
+    }
+    for secret_key, env_key in key_map.items():
+        val = st.secrets.get(secret_key)
+        if val and not os.getenv(env_key):
+            os.environ[env_key] = str(val)
 
 # ---------- page ----------
 st.set_page_config(page_title="HH Job Recommender", page_icon="💼", layout="wide")
 init_db()
+_apply_hh_oauth_from_streamlit_secrets()
 
 # Initialize canonical embedding store (memmap on disk)
 # Dim for 'paraphrase-multilingual-MiniLM-L12-v2' is 384
@@ -151,7 +166,6 @@ def _load_cached_latest_vacancies(area_id: int, period_days: int, limit: int) ->
     conn = get_conn()
     cur = conn.cursor()
 
-    # Best-effort cutoff filter: HH published_at is ISO-like; lexicographic compare works in most cases.
     cutoff = (datetime.now(timezone.utc) - timedelta(days=int(period_days))).isoformat().replace("+00:00", "Z")
 
     cur.execute(
@@ -425,6 +439,15 @@ def _fetch_default_startup(area_id: int, period_days: int, refresh_nonce: int) -
         order_by="publication_time",
     )
 
+def _safe_fetch_default_startup(area_id: int, period_days: int, refresh_nonce: int) -> List[dict]:
+    try:
+        return _fetch_default_startup(area_id, period_days, refresh_nonce)
+    except Exception as e:
+        st.warning(
+            "Не удалось получить свежие вакансии из HH API. "
+            f"Проверьте доступ к api.hh.ru (ошибка: {e})."
+        )
+        return []
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def _fetch_term(area_id: int, term: str, per_term: int, period_days: int, refresh_nonce: int) -> List[dict]:
@@ -702,7 +725,7 @@ def _try_global_rank(resume_text: str, area_id: int, period_days: int) -> Option
     return df
 
 
-# ---------- auth UI ----------
+# ---------- auth UI (centered) ----------
 def auth_screen():
     left, center, right = st.columns([2, 2, 2])
 
@@ -785,7 +808,6 @@ period_days = st.sidebar.selectbox("Период вакансий (дней)", [
 update_hours = st.sidebar.selectbox("Авто-обновление (часы)", [6, 12, 24], index=2)
 
 st.sidebar.subheader("Резюме")
-
 resume_source = st.sidebar.radio("Источник резюме", ["None", "PDF resume", "Created resume"], index=0)
 st.session_state.resume_source = resume_source
 
@@ -869,7 +891,7 @@ if do_search:
 
     if not has_resume:
         with st.spinner("Загружаем дефолтные вакансии (без эмбеддингов)..."):
-            items = _fetch_default_startup(int(area_id), int(period_days), int(st.session_state.refresh_nonce))
+            items = _safe_fetch_default_startup(int(area_id), int(period_days), int(st.session_state.refresh_nonce))
             df0 = _items_to_df(items)
         df0["similarity_score"] = pd.NA
         df0 = _sort_default_latest_with_favorites(df0, favorites)
@@ -1032,7 +1054,7 @@ if st.session_state.last_results_df is None:
 
         # 2) Cache miss => fetch from HH once, then store to disk for next startup
         if df0 is None or df0.empty:
-            items = _fetch_default_startup(int(area_id), int(period_days), int(st.session_state.refresh_nonce))
+            items = _safe_fetch_default_startup(int(area_id), int(period_days), int(st.session_state.refresh_nonce))
             df0 = _items_to_df(items)
             _cache_latest_items_to_db(items, int(area_id))
 
@@ -1096,13 +1118,13 @@ try:
                             batches.append([])
                 merged = _dedupe_merge(batches)
                 _df = _items_to_df(merged)
-                if df is None or df.empty:
+                if _df is None or df.empty:
                     st.warning("HH не вернул вакансии по выбранным параметрам.")
                     st.session_state.last_results_df = pd.DataFrame()
                     st.stop()
 
                 model = _get_model()
-                if df is None or df.empty:
+                if _df is None or df.empty:
                     st.warning("По этому запросу вакансии не найдены.")
                     st.stop()
                 job_embs = _build_embeddings_for_df(_df, model)
@@ -1122,7 +1144,7 @@ try:
 
         else:
             # default_global_latest OR explicit_params => refresh latest
-            items = _fetch_default_startup(int(area_id), int(period_days), int(st.session_state.refresh_nonce))
+            items = _safe_fetch_default_startup(int(area_id), int(period_days), int(st.session_state.refresh_nonce))
             _df = _items_to_df(items)
             _df["similarity_score"] = pd.NA
             _df = _sort_default_latest_with_favorites(_df, favorites)
