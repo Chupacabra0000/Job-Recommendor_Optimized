@@ -808,10 +808,10 @@ period_days = st.sidebar.selectbox("Период вакансий (дней)", [
 update_hours = st.sidebar.selectbox("Авто-обновление (часы)", [6, 12, 24], index=2)
 
 st.sidebar.subheader("Резюме")
-resume_source = st.sidebar.radio("Источник резюме", ["Без Резюме", "PDF Резме", "Создание"], index=0)
+resume_source = st.sidebar.radio("Источник резюме", ["None", "PDF Резюме", "Тестовое"], index=0)
 st.session_state.resume_source = resume_source
 
-if resume_source == "PDF resume":
+if resume_source == "PDF Резюме":
     pdf = st.sidebar.file_uploader("Загрузите PDF", type=["pdf"])
     if pdf is not None:
         with st.spinner("Читаем PDF..."):
@@ -820,7 +820,7 @@ if resume_source == "PDF resume":
 resumes = list_resumes(user_id)
 selected_resume_text = ""
 rid = None
-if resume_source == "Created resume" and resumes:
+if resume_source == "Тестовое" and resumes:
     opts = {f'{r["name"]} (#{r["id"]})': r["id"] for r in resumes}
     label = st.sidebar.selectbox("Выберите резюме", list(opts.keys()))
     st.session_state.selected_resume_label = label
@@ -829,9 +829,9 @@ if resume_source == "Created resume" and resumes:
     selected_resume_text = sel["text"] if sel else ""
 
 resume_text = ""
-if resume_source == "PDF resume":
+if resume_source == "PDF Резюме":
     resume_text = st.session_state.pdf_text
-elif resume_source == "Created resume":
+elif resume_source == "Тестовое":
     resume_text = selected_resume_text
 has_resume = bool((resume_text or "").strip())
 
@@ -949,7 +949,7 @@ if do_search:
         # ---- SAVE HISTORY (resume-based search) ----
         search_id = None
         try:
-            if resume_source == "Created resume":
+            if resume_source == "Тестовое":
                 resume_id_to_save = int(rid) if rid is not None else None
                 resume_key = f"rid:{resume_id_to_save}" if resume_id_to_save is not None else "rid:0"
                 resume_label = st.session_state.get("selected_resume_label")
