@@ -106,12 +106,12 @@ def _get(url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 30) -
 
         if r.status_code == 403:
             raise RuntimeError(
-                "HH API error 403 (forbidden). "
+                "HH API request failed: 403 (forbidden). "
                 "Your IP/proxy/region or HH headers may be blocked. "
                 f"Response: {r.text}"
             )
 
-        raise RuntimeError(f"HH API error {r.status_code}: {r.text}")
+        raise RuntimeError(f"HH API request failed: {r.status_code} {r.text}")
 
     raise RuntimeError(f"HH API request failed after {max_attempts} attempts: {last_err}")
 
